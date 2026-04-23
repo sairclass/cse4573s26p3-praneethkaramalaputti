@@ -1,11 +1,3 @@
-'''
-Notes:
-1. All of your implementation should be in this file. This is the ONLY .py file you need to edit & submit. 
-2. Please Read the instructions and do not modify the input and output formats of function detect_faces() and cluster_faces().
-3. If you want to show an image for debugging, please use show_image() function in helper.py.
-4. Please do NOT save any intermediate files in your final submission.
-'''
-
 
 import torch
 
@@ -14,64 +6,122 @@ import face_recognition
 from typing import Dict, List
 from utils import show_image
 
-'''
-Please do NOT add any imports. The allowed libraries are already imported for you.
-'''
+
+def _tensor_to_numpy(img: torch.Tensor):
+    img = img.detach().cpu()
+    if img.dim() == 3 and img.shape[0] == 3:
+        img = img.permute(1, 2, 0)
+
+    #values are uint8 in [0, 255]
+    if img.dtype != torch.uint8:
+        img = img.float()
+        if img.max() <= 1.0:
+            img = img * 255.0
+        img = img.clamp(0, 255).to(torch.uint8)
+
+    return img.contiguous().numpy()
+
 
 def detect_faces(img: torch.Tensor) -> List[List[float]]:
-    """
-    Args:
-        img : input image is a torch.Tensor represent an input image of shape H x W x 3.
-            H is the height of the image, W is the width of the image. 3 is the [R, G, B] channel (NOT [B, G, R]!).
-
-    Returns:
-        detection_results: a python nested list. 
-            Each element is the detected bounding boxes of the faces (may be more than one faces in one image).
-            The format of detected bounding boxes a python list of float with length of 4. It should be formed as 
-            [topleft-x, topleft-y, box-width, box-height] in pixels.
-    """
-    """
-    Torch info: All intermediate data structures should use torch data structures or objects. 
-    Numpy and cv2 are not allowed, except for face recognition API where the API returns plain python Lists, convert them to torch.Tensor.
-    
-    """
+   
     detection_results: List[List[float]] = []
 
-    ##### YOUR IMPLEMENTATION STARTS HERE #####
+   
+
+    img_np = _tensor_to_numpy(img)
+
+    face_locations = face_recognition.face_locations(img_np, model='hog') 
+
+    for (top, right, bottom, left) in face_locations:
+        topleft_x = float(left)
+        topleft_y = float(top)
+        box_width = float(right - left)
+        box_height = float(bottom - top)
+        detection_results.append([topleft_x, topleft_y, box_width, box_height])
+
 
     return detection_results
 
 
-
 def cluster_faces(imgs: Dict[str, torch.Tensor], K: int) -> List[List[str]]:
-    """
-    Args:
-        imgs : input images. It is a python dictionary
-            The keys of the dictionary are image names (without path).
-            Each value of the dictionary is a torch.Tensor represent an input image of shape H x W x 3.
-            H is the height of the image, W is the width of the image. 3 is the [R, G, B] channel (NOT [B, G, R]!).
-        K: Number of clusters.
-    Returns:
-        cluster_results: a python list where each elemnts is a python list.
-            Each element of the list a still a python list that represents a cluster.
-            The elements of cluster list are python strings, which are image filenames (without path).
-            Note that, the final filename should be from the input "imgs". Please do not change the filenames.
-    """
-    """
-    Torch info: All intermediate data structures should use torch data structures or objects. 
-    Numpy and cv2 are not allowed, except for face recognition API where the API returns plain python Lists, convert them to torch.Tensor.
     
-    """
-    cluster_results: List[List[str]] = [[] for _ in range(K)] # Please make sure your output follows this data format.
-        
-    ##### YOUR IMPLEMENTATION STARTS HERE #####
-    
+    cluster_results: List[List[str]] = [[] for _ in range(K)]
+
+    image_names: List[str] = []
+    image_encodings: List[torch.Tensor] = []
+    for img_name, img_tensor in imgs.items():
+        image_names.append(img_name)
+
+        img_np = _tensor_to_numpy(img_tensor)
+
+        face_locations = face_recognition.face_locations(img_np, model='hog')
+
+        if len(face_locations) == 0:
+            image_encodings.append(None)
+            continue
+
+        encodings = face_recognition.face_encodings(
+            img_np,
+            known_face_locations=face_locations
+        )
+
+        if len(encodings) == 0:
+            image_encodings.append(None)
+        else:
+            enc_tensor = torch.tensor(encodings[0], dtype=torch.float32)
+            image_encodings.append(enc_tensor)
+
+    valid_indices = [i for i, e in enumerate(image_encodings) if e is not None]
+    invalid_indices = [i for i, e in enumerate(image_encodings) if e is None]
+
+    if len(valid_indices) == 0:
+        for name in image_names:
+            cluster_results[0].append(name)
+        return cluster_results
+
+    valid_encodings = torch.stack([image_encodings[i] for i in valid_indices])
+    M = valid_encodings.shape[0]
+    actual_K = min(K, M)
+    centroids = _kmeans_plus_plus_init(valid_encodings, actual_K)
+    assignments = torch.full((M,), -1, dtype=torch.long)
+    for _ in range(300):
+        x_sq = (valid_encodings ** 2).sum(dim=1, keepdim=True)
+        c_sq = (centroids ** 2).sum(dim=1, keepdim=True).T
+        cross = valid_encodings @ centroids.T
+        dists = (x_sq + c_sq - 2.0 * cross).clamp(min=0.0)
+        new_assignments = dists.argmin(dim=1)
+        if torch.equal(new_assignments, assignments):
+            break
+        assignments = new_assignments
+        for k in range(actual_K):
+            mask = (assignments == k)
+            if mask.any():
+                centroids[k] = valid_encodings[mask].mean(dim=0)
+    for idx_in_valid, img_idx in enumerate(valid_indices):
+        cluster_id = int(assignments[idx_in_valid].item())
+        cluster_results[cluster_id].append(image_names[img_idx])
+    for img_idx in invalid_indices:
+        cluster_results[0].append(image_names[img_idx])
+
     return cluster_results
 
+def _kmeans_plus_plus_init(data: torch.Tensor, K: int) -> torch.Tensor:
+    M, D = data.shape
+    centroids = torch.zeros(K, D, dtype=data.dtype)
+    first_idx = int(torch.randint(M, (1,)).item())
+    centroids[0] = data[first_idx]
 
-'''
-If your implementation requires multiple functions. Please implement all the functions you design under here.
-But remember the above 2 functions are the only functions that will be called by task1.py and task2.py.
-'''
-
-# TODO: Your functions. (if needed)
+    for k in range(1, K):
+        chosen = centroids[:k]
+        x_sq = (data ** 2).sum(dim=1, keepdim=True)
+        c_sq = (chosen ** 2).sum(dim=1, keepdim=True).T
+        cross = data @ chosen.T
+        dists = (x_sq + c_sq - 2.0 * cross).clamp(min=0.0)
+        min_dists = dists.min(dim=1).values
+        if float(min_dists.sum().item()) == 0.0:
+            next_idx = int(torch.randint(M, (1,)).item())
+        else:
+            probs = min_dists / min_dists.sum()
+            next_idx = int(torch.multinomial(probs, num_samples=1).item())
+        centroids[k] = data[next_idx]
+    return centroids
